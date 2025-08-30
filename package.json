@@ -1,0 +1,27 @@
+{
+  "name": "ibkr-proxy",
+  "version": "1.0.0",
+  "description": "Lightweight Python FastAPI proxy server that bridges web applications to Interactive Brokers Gateway/TWS via REST API",
+  "keywords": ["interactive-brokers", "trading", "api", "proxy", "fastapi", "ib-gateway", "tws"],
+  "author": "IBKR Proxy Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-username/ibkr-proxy.git"
+  },
+  "bugs": {
+    "url": "https://github.com/your-username/ibkr-proxy/issues"
+  },
+  "homepage": "https://github.com/your-username/ibkr-proxy#readme",
+  "scripts": {
+    "start": "python main.py",
+    "dev": "python main.py --proxy-host 0.0.0.0",
+    "build": "python build.py",
+    "install": "pip install -r requirements.txt",
+    "test": "python -m pytest tests/ -v",
+    "clean": "rm -rf dist/ build/ *.spec __pycache__/"
+  },
+  "engines": {
+    "python": ">=3.8"
+  }
+}
