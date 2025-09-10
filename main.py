@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from ib_insync import IB
+from ib_insync import IB, Contract
 import logging
 import asyncio
 import argparse
+import json
 from contextlib import asynccontextmanager
+from typing import Dict, Set
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -22,6 +24,39 @@ config = {
 }
 
 ib = IB()
+
+# Global subscription manager
+class SubscriptionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, Set[WebSocket]] = {}
+        self.price_subscriptions: Dict[int, Contract] = {}
+        self.candle_subscriptions: Dict[int, tuple] = {}
+        self.listeners_setup = False
+    
+    async def connect(self, websocket: WebSocket, subscription_type: str):
+        await websocket.accept()
+        if subscription_type not in self.active_connections:
+            self.active_connections[subscription_type] = set()
+        self.active_connections[subscription_type].add(websocket)
+    
+    def disconnect(self, websocket: WebSocket, subscription_type: str):
+        if subscription_type in self.active_connections:
+            self.active_connections[subscription_type].discard(websocket)
+    
+    async def broadcast(self, subscription_type: str, data: dict):
+        if subscription_type in self.active_connections:
+            disconnected = set()
+            for connection in self.active_connections[subscription_type]:
+                try:
+                    await connection.send_text(json.dumps(data))
+                except:
+                    disconnected.add(connection)
+            for conn in disconnected:
+                self.active_connections[subscription_type].discard(conn)
+    
+
+
+manager = SubscriptionManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -189,7 +224,7 @@ async def load_data(conId: int, interval: str, limit: int = 100, duration: str =
         
         bars = await ib.reqHistoricalDataAsync(
             full_contract, endDateTime='', durationStr=duration,
-            barSizeSetting=bar_size, whatToShow='TRADES', useRTH=True
+            barSizeSetting=bar_size, whatToShow='TRADES', useRTH=False
         )
         
         logger.info(f"Received {len(bars)} bars")
@@ -259,7 +294,7 @@ async def load_more_data(conId: int, interval: str, limit: int = 100, endTime: i
         
         bars = await ib.reqHistoricalDataAsync(
             full_contract, endDateTime=end_date_time, durationStr=duration,
-            barSizeSetting=bar_size, whatToShow='TRADES', useRTH=True
+            barSizeSetting=bar_size, whatToShow='TRADES', useRTH=False
         )
         
         logger.info(f"Received {len(bars)} bars")
@@ -308,6 +343,110 @@ async def get_symbol_info(conId: int):
     except Exception as e:
         logger.error(f"Symbol info error: {e}")
         return None
+
+@app.websocket("/ws/price/{conid}")
+async def websocket_price(websocket: WebSocket, conid: int):
+    await manager.connect(websocket, f"price_{conid}")
+    
+    try:
+        contract = Contract()
+        contract.conId = conid
+        contract_details = await ib.reqContractDetailsAsync(contract)
+        if not contract_details:
+            await websocket.close()
+            return
+        full_contract = contract_details[0].contract
+        
+        ticker = ib.reqMktData(full_contract, '', False, False)
+        
+        def onPendingTickers(tickers):
+            for t in tickers:
+                if t.contract.conId == conid:
+                    asyncio.create_task(manager.broadcast(f"price_{conid}", {
+                        "type": "price", "conId": conid,
+                        "price": float(t.last) if t.last else 0,
+                        "bid": float(t.bid) if t.bid else 0,
+                        "ask": float(t.ask) if t.ask else 0,
+                        "volume": float(t.volume) if t.volume else 0
+                    }))
+        
+        ib.pendingTickersEvent += onPendingTickers
+        
+        while True:
+            await asyncio.sleep(1)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, f"price_{conid}")
+        ib.cancelMktData(full_contract)
+        ib.pendingTickersEvent -= onPendingTickers
+
+@app.websocket("/ws/candles/{conid}/{interval}")
+async def websocket_candles(websocket: WebSocket, conid: int, interval: str):
+    await manager.connect(websocket, f"candles_{conid}_{interval}")
+    
+    try:
+        contract = Contract()
+        contract.conId = conid
+        contract_details = await ib.reqContractDetailsAsync(contract)
+        if not contract_details:
+            await websocket.close()
+            return
+        full_contract = contract_details[0].contract
+        
+        def onBarUpdate(bars, hasNewBar):
+            if hasNewBar and bars:
+                bar = bars[-1]
+                asyncio.create_task(manager.broadcast(f"candles_{conid}_{interval}", {
+                    "type": "candle", "conId": conid,
+                    "time": int(bar.time.timestamp()),
+                    "open": float(bar.open_), "high": float(bar.high),
+                    "low": float(bar.low), "close": float(bar.close),
+                    "volume": float(bar.volume)
+                }))
+        
+        bars = ib.reqRealTimeBars(full_contract, 5, 'TRADES', False)
+        bars.updateEvent += onBarUpdate
+        
+        while True:
+            await asyncio.sleep(1)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, f"candles_{conid}_{interval}")
+        ib.cancelRealTimeBars(full_contract)
+
+@app.websocket("/ws/orderbook/{conid}")
+async def websocket_orderbook(websocket: WebSocket, conid: int):
+    await manager.connect(websocket, f"orderbook_{conid}")
+    
+    try:
+        contract = Contract()
+        contract.conId = conid
+        contract_details = await ib.reqContractDetailsAsync(contract)
+        if not contract_details:
+            await websocket.close()
+            return
+        full_contract = contract_details[0].contract
+        
+        ticker = ib.reqMktData(full_contract, '', False, False)
+        
+        def onPendingTickers(tickers):
+            for t in tickers:
+                if t.contract.conId == conid:
+                    asyncio.create_task(manager.broadcast(f"orderbook_{conid}", {
+                        "type": "orderbook",
+                        "bids": [{"price": float(t.bid), "quantity": float(t.bidSize)}] if t.bid else [],
+                        "asks": [{"price": float(t.ask), "quantity": float(t.askSize)}] if t.ask else []
+                    }))
+        
+        ib.pendingTickersEvent += onPendingTickers
+        
+        while True:
+            await asyncio.sleep(1)
+            
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, f"orderbook_{conid}")
+        ib.cancelMktData(full_contract)
+        ib.pendingTickersEvent -= onPendingTickers
 
 @app.get("/health")
 async def health_check():
